@@ -26,13 +26,15 @@ description: Use before staging files, committing (including after pre-commit fa
    ```bash
    git add path/to/file1 path/to/file2
    ```
-4. `git add .` and `git add -A` are **FORBIDDEN** — they silently include unrelated changes. Stop immediately. Do not run this command. Explain the situation to the user.
-
-**Step 4: Verify staged files**
-```bash
-git diff --staged --stat
-```
-Confirm only intended files appear. If unintended files are staged, unstage them: `git restore --staged <file>`
+   > **WARNING:** `git add .` and `git add -A` are **FORBIDDEN** — they silently include unrelated changes. Stop immediately. Do not run these commands. Explain the situation to the user.
+4. Verify staged files:
+   ```bash
+   git diff --staged --stat
+   ```
+   Confirm only intended files appear. If unintended files are staged, unstage them:
+   ```bash
+   git restore --staged <file>
+   ```
 
 ## Gate 3 — Before any commit
 
