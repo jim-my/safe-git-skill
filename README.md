@@ -1,6 +1,6 @@
 # safe-git
 
-A Claude Code skill that enforces safe git operations through three hard-gate checklists.
+A Claude Code skill that enforces safe git operations through four hard-gate checklists.
 
 ## What it prevents
 
