@@ -26,7 +26,13 @@ description: Use before staging files, committing (including after pre-commit fa
    ```bash
    git add path/to/file1 path/to/file2
    ```
-4. `git add .` and `git add -A` are **FORBIDDEN** — they silently include unrelated changes
+4. `git add .` and `git add -A` are **FORBIDDEN** — they silently include unrelated changes. Stop immediately. Do not run this command. Explain the situation to the user.
+
+**Step 4: Verify staged files**
+```bash
+git diff --staged --stat
+```
+Confirm only intended files appear. If unintended files are staged, unstage them: `git restore --staged <file>`
 
 ## Gate 3 — Before any commit
 
@@ -39,7 +45,7 @@ After fixing the issue, use a fresh commit:
 git commit -m "your message"
 ```
 
-`git commit --amend` is **FORBIDDEN** in this case. The commit you would be amending is the last *pushed* commit, not a new one.
+`git commit --amend` is **FORBIDDEN** in this case. Stop immediately. Do not run this command. Explain the situation to the user. The commit you would be amending is the last *pushed* commit, not a new one.
 
 ### Before any other use of `git commit --amend`:
 
@@ -48,13 +54,26 @@ Run:
 git log @{u}..HEAD --oneline
 ```
 
+> **Note:** If this command fails with "no upstream configured" or similar error, the branch is local-only (never pushed). Amend is safe.
+
 - **Returns commits** → amend is safe (those commits are unpushed)
-- **Returns nothing** → amend is **FORBIDDEN**, all commits are already pushed
+- **Returns nothing** → amend is **FORBIDDEN**, all commits are already pushed. Stop immediately. Do not run this command. Explain the situation to the user.
 
   Use a fresh commit instead:
   ```bash
   git commit -m "your message"
   ```
+
+## Gate 4 — Before creating a PR
+
+1. Run `git branch --show-current`
+2. If result is `main` or `master` → **STOP immediately. Do not proceed.**
+
+   You cannot create a PR from main/master. Create a feature branch first:
+   ```bash
+   git checkout -b <descriptive-branch-name>
+   # move your changes to the feature branch if needed
+   ```
 
 ## Recommended Hook Setup
 
