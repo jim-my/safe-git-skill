@@ -1,6 +1,9 @@
 #!/bin/bash
 branch=$(git branch --show-current)
+if [ -z "$branch" ]; then
+  exit 0
+fi
 if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
-  echo "ERROR: Direct commit to $branch is not allowed. Create a feature branch first."
+  echo "ERROR: Direct commit to $branch is not allowed. Create a feature branch first." >&2
   exit 1
 fi
