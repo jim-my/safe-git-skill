@@ -1,6 +1,6 @@
 ---
 name: safe-git
-description: Use before staging files, committing (including after pre-commit failures), or creating a PR — enforces safe git operations to prevent amending pushed commits, working on main, and staging irrelevant files
+description: Use before starting any task, staging files, committing (including after pre-commit failures), or creating a PR — enforces safe git operations to prevent working on stale branches, amending pushed commits, working on main, and staging irrelevant files
 ---
 
 # safe-git
@@ -8,6 +8,8 @@ description: Use before staging files, committing (including after pre-commit fa
 **Announce at start:** "I'm using the safe-git skill to verify safe git operations."
 
 ## Gate 1 — Before starting any work on a task
+
+### 1a — Confirm you're on a feature branch
 
 1. Run `git branch --show-current`
 2. If result is `main` or `master` → **STOP**
@@ -17,6 +19,31 @@ description: Use before staging files, committing (including after pre-commit fa
    git checkout -b <descriptive-branch-name>
    ```
    Then begin work on the feature branch.
+
+### 1b — Confirm your branch is up-to-date
+
+1. Run `git fetch` to update remote tracking info
+2. Check if an upstream is configured:
+   ```bash
+   git rev-parse @{u} 2>/dev/null
+   ```
+   If this fails (no upstream set) → branch is local-only. Skip to Gate 2.
+3. Run:
+   ```bash
+   git log HEAD..@{u} --oneline
+   ```
+   - **Returns nothing** → branch is up-to-date. Proceed.
+   - **Returns commits** → **WARN the user:**
+
+     > Your local branch is behind the remote by N commit(s). Starting work now risks merge conflicts and duplicated effort.
+     >
+     > Recommended: pull before starting.
+     > ```bash
+     > git pull
+     > ```
+     > If you choose to proceed without pulling, inform the user of the risk.
+
+   > **Note:** If `git log @{u}..HEAD --oneline` also returns commits, the branches have **diverged**. This requires manual resolution — do not blindly `git pull`. Warn the user explicitly and stop until they decide how to proceed.
 
 ## Gate 2 — Before staging files
 
