@@ -12,7 +12,7 @@ A Claude Code skill that enforces safe git operations through four hard-gate che
 ## Install
 
 ```bash
-git clone https://github.com/<you>/safe-git-skill ~/work/safe-git-skill
+git clone https://github.com/jim-my/safe-git-skill ~/work/safe-git-skill
 cd ~/work/safe-git-skill
 ./install.sh
 ```
