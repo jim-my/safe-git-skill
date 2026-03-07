@@ -18,12 +18,18 @@ Goal: prevent multiple agents from working in the same repository folder.
    ```
 2. If `git_dir` equals `common_dir` (main worktree) → create and switch to a dedicated linked worktree before any task work:
    ```bash
-   # Example path and branch names; use project conventions
-   git worktree add .worktrees/<agent-or-task-name> -b <feature-branch-name>
-   cd .worktrees/<agent-or-task-name>
+   # Example naming convention:
+   # <agent-or-ticket>-<short-task>, e.g. codex-safegit-gate0
+   git worktree add .worktrees/<agent-or-ticket>-<short-task> -b <feature-branch-name>
    ```
+   - Ensure `.worktrees/` is in `.gitignore` before creating project-local worktrees.
+   - Switch your active session/tool working directory to the new worktree path.
    After switching, continue to Gate 1 in that new worktree.
 3. If already in a linked worktree (`git_dir` differs from `common_dir`) → continue to Gate 1.
+4. After task completion and merge, clean up the linked worktree:
+   ```bash
+   git worktree remove .worktrees/<agent-or-ticket>-<short-task>
+   ```
 
 > **Note:** This gate is structural isolation. It does not replace branch safety checks; it enforces one active agent workspace per folder.
 
