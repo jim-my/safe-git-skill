@@ -7,6 +7,32 @@ description: Use before starting any task, staging files, committing (including 
 
 **Announce at start:** "I'm using the safe-git skill to verify safe git operations."
 
+## Gate 0 — Ensure workspace isolation before starting
+
+Goal: prevent multiple agents from working in the same repository folder.
+
+1. Detect whether you are in the main worktree or an already-isolated linked worktree:
+   ```bash
+   git_dir=$(git rev-parse --git-dir)
+   common_dir=$(git rev-parse --git-common-dir)
+   ```
+2. If `git_dir` equals `common_dir` (main worktree) → create and switch to a dedicated linked worktree before any task work:
+   - Ensure `.worktrees/` is in `.gitignore` before creating project-local worktrees.
+   ```bash
+   # Example naming convention:
+   # <agent-or-ticket>-<short-task>, e.g. codex-safegit-gate0
+   git worktree add .worktrees/<agent-or-ticket>-<short-task> -b <feature-branch-name>
+   ```
+   - Switch your active session/tool working directory to the new worktree path.
+   After switching, continue to Gate 1 in that new worktree.
+3. If already in a linked worktree (`git_dir` differs from `common_dir`) → continue to Gate 1.
+4. After task completion and merge, clean up the linked worktree:
+   ```bash
+   git worktree remove .worktrees/<agent-or-ticket>-<short-task>
+   ```
+
+> **Note:** This gate is structural isolation. It does not replace branch safety checks; it enforces one active agent workspace per folder.
+
 ## Gate 1 — Before starting any work on a task
 
 ### 1a — Confirm you're on a feature branch
