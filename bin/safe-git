@@ -1,0 +1,538 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  safe-git worktree start <path> -b <branch> --purpose <text> [--base <ref>] [--issue <id>] [--title <text>] [--no-fetch]
+  safe-git worktree adopt <path> --purpose <text> [--base <ref>] [--issue <id>] [--title <text>] [--no-fetch]
+  safe-git check start [--read-only] [--no-fetch]
+  safe-git check pr
+  safe-git check done
+
+`worktree start` creates an isolated linked worktree and records why it
+exists in the repo's local git metadata.
+`worktree adopt` moves the current clean non-main branch from the main
+worktree into a linked worktree and returns the main checkout to the
+default branch.
+
+`start` and `pr` are read-only gates — they print the next safe action
+when a gate fails. `done` is a post-merge cleanup that fast-forwards
+the default branch, then removes the worktree (if any) and the local
+branch, after verifying the branch's PR is MERGED via `gh pr view`.
+
+Flags for `check start`:
+  --read-only  demotes worktree-isolation and freshness to advisory
+  --no-fetch   skips `git fetch --all --prune`; freshness uses cached refs.
+               Only safe when the caller already fetched.
+EOF
+}
+
+fail() {
+  printf 'safe-git: BLOCKED: %s\n' "$*" >&2
+  exit 1
+}
+
+ok() {
+  printf 'safe-git: OK: %s\n' "$*"
+}
+
+require_repo() {
+  git rev-parse --show-toplevel >/dev/null 2>&1 || fail "not inside a git repository"
+}
+
+branch_name() {
+  git branch --show-current
+}
+
+is_main_branch() {
+  local branch="$1"
+  [[ "$branch" == "main" || "$branch" == "master" ]]
+}
+
+is_main_worktree() {
+  # Submodules have both git-dir and git-common-dir pointing into
+  # .git/modules/<name>, which would look like the main worktree by
+  # the dir-equality heuristic. Treat them as non-main worktrees so
+  # we don't refuse implementation work inside a submodule checkout.
+  if [[ -n "$(git rev-parse --show-superproject-working-tree 2>/dev/null)" ]]; then
+    return 1
+  fi
+  local git_dir common_dir
+  # Resolve both to absolute paths so relative-vs-absolute differences
+  # (which git rev-parse reports inconsistently across contexts) don't
+  # cause a false negative.
+  git_dir="$(cd "$(git rev-parse --git-dir)" && pwd)"
+  common_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+  [[ "$git_dir" == "$common_dir" ]]
+}
+
+check_clean_state() {
+  # Block when HEAD is partial: commits made here are either lost or
+  # land unpredictably when the operation finishes.
+  local git_dir
+  git_dir="$(git rev-parse --git-dir)"
+  [[ ! -d "$git_dir/rebase-merge" ]] || fail "rebase in progress. Finish or abort before continuing."
+  [[ ! -d "$git_dir/rebase-apply" ]] || fail "rebase in progress. Finish or abort before continuing."
+  [[ ! -f "$git_dir/MERGE_HEAD" ]] || fail "merge in progress. Finish or abort before continuing."
+  [[ ! -f "$git_dir/CHERRY_PICK_HEAD" ]] || fail "cherry-pick in progress. Finish or abort before continuing."
+  [[ ! -f "$git_dir/REVERT_HEAD" ]] || fail "revert in progress. Finish or abort before continuing."
+  [[ ! -f "$git_dir/BISECT_LOG" ]] || fail "bisect in progress. Finish or abort before continuing."
+}
+
+check_worktree_clean() {
+  local label="${1:-working tree}"
+  # Dirty tree means teardown would discard work. `--porcelain` covers
+  # unstaged, staged, and untracked.
+  if [[ -n "$(git status --porcelain)" ]]; then
+    fail "$label is dirty. Commit, push, or stash before teardown."
+  fi
+}
+
+default_base_ref() {
+  local default_branch
+  default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
+  printf 'origin/%s\n' "${default_branch:-main}"
+}
+
+default_branch_name() {
+  local default_branch
+  default_branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
+  printf '%s\n' "${default_branch:-main}"
+}
+
+# Derive the local branch name from a remote-tracking ref.
+# Handles both `origin/main` and `refs/remotes/origin/main` forms,
+# as well as bare branch names like `main` (passed through as-is).
+ref_to_local_branch() {
+  local ref="$1"
+  local branch="${ref#refs/remotes/}"
+  branch="${branch#origin/}"
+  printf '%s\n' "$branch"
+}
+
+fast_forward_default_branch() {
+  local default_branch default_ref
+  default_branch="$(default_branch_name)"
+  default_ref="origin/$default_branch"
+  git checkout "$default_branch" \
+    || fail "could not switch to $default_branch; resolve manually"
+  git fetch origin "$default_branch" \
+    || fail "could not fetch $default_ref; resolve manually"
+  git merge --ff-only "$default_ref" \
+    || fail "could not fast-forward $default_branch; resolve manually"
+}
+
+check_branch_not_main() {
+  local branch
+  branch="$(branch_name)"
+  [[ -n "$branch" ]] || fail "detached HEAD; use safe-git worktree start from the default branch for new work, or switch to the feature branch you already created"
+  if is_main_branch "$branch"; then
+    fail "current branch is $branch. Use safe-git worktree start .worktrees/<task> -b <feature-branch> --purpose \"<why this worktree exists>\" before writing. If work already happened here, move it into a linked worktree instead of just creating a branch and continuing in the main worktree."
+  fi
+}
+
+fetch_remotes() {
+  git fetch --all --prune
+}
+
+check_freshness() {
+  local branch upstream behind ahead
+  branch="$(branch_name)"
+
+  if upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"; then
+    # Capture into variables so a failing `git log` surfaces as an
+    # error instead of an empty string that reads as "up to date".
+    # `set -e` is disabled inside `if (( ))` and `[[ ... ]]` test
+    # conditions, so the previous command-substitution pattern
+    # silently swallowed errors.
+    behind="$(git log "HEAD..$upstream" --oneline)" \
+      || fail "git log HEAD..$upstream failed; cannot verify freshness"
+    ahead="$(git log "$upstream..HEAD" --oneline)" \
+      || fail "git log $upstream..HEAD failed; cannot verify freshness"
+    if [[ -n "$behind" ]]; then
+      if [[ -n "$ahead" ]]; then
+        fail "branch has diverged from $upstream. Resolve manually before continuing."
+      fi
+      fail "branch is behind $upstream. Pull or rebase before continuing."
+    fi
+    ok "branch is up to date with $upstream"
+    return
+  fi
+
+  # No upstream configured: enumerate every remote, not just origin.
+  # Rev-parsing only origin/$branch missed fork workflows that name
+  # the primary remote `upstream`, `fork`, etc., returning a false OK
+  # when a same-named remote branch existed. Branch names cannot
+  # contain `*`, `?`, `[`, or whitespace (git-check-ref-format), so
+  # $branch is safe as a for-each-ref pattern and as an output token.
+  local matching
+  matching="$(git for-each-ref --format='%(refname:short)' "refs/remotes/*/$branch" 2>/dev/null | tr '\n' ' ')"
+  matching="${matching% }"
+
+  if [[ -n "$matching" ]]; then
+    fail "no upstream is configured, but same-named branch exists on: $matching. Set upstream or compare/rebase explicitly before continuing."
+  fi
+
+  ok "branch has no upstream and no same-named branch on any remote"
+}
+
+check_start() {
+  local read_only=false no_fetch=false base_ref
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --read-only) read_only=true; shift ;;
+      --no-fetch) no_fetch=true; shift ;;
+      *) fail "unknown option for check start: $1 (usage: safe-git check start [--read-only] [--no-fetch])" ;;
+    esac
+  done
+
+  require_repo
+  # Clean-state is checked even for --read-only: HEAD is partial
+  # during rebase/merge/cherry-pick, so any read against it is
+  # misleading. Only worktree and freshness are demoted to advisory
+  # by --read-only.
+  check_clean_state
+  if "$read_only"; then
+    ok "read-only check; worktree isolation and freshness are advisory"
+    return
+  fi
+
+  if ! "$no_fetch"; then
+    fetch_remotes
+  fi
+  if is_main_worktree; then
+    base_ref="$(default_base_ref)"
+    git rev-parse --verify --quiet "$base_ref" >/dev/null || fail "main worktree detected, but default base $base_ref does not exist. Choose an explicit base ref for the new worktree."
+    fail "main worktree detected. Create an isolated worktree, for example: safe-git worktree start .worktrees/<task> -b <feature-branch> --base $base_ref --purpose \"<why this worktree exists>\""
+  fi
+
+  check_branch_not_main
+  check_freshness
+}
+
+check_pr() {
+  if [[ $# -gt 0 ]]; then
+    fail "unknown option for check pr: $1 (usage: safe-git check pr)"
+  fi
+  require_repo
+  check_clean_state
+  check_branch_not_main
+  ok "current branch is eligible for PR creation"
+}
+
+check_done() {
+  if [[ $# -gt 0 ]]; then
+    fail "unknown option for check done: $1 (usage: safe-git check done)"
+  fi
+  require_repo
+  # Clean-state first: if rebase/merge/cherry-pick is in flight, HEAD
+  # is partial and we cannot reason about what "merged" means.
+  check_clean_state
+
+  local branch
+  branch="$(branch_name)"
+  [[ -n "$branch" ]] || fail "detached HEAD; nothing to clean up"
+  if is_main_branch "$branch"; then
+    fail "current branch is $branch; refusing to delete the default branch"
+  fi
+
+  check_worktree_clean
+
+  # Verify the PR is MERGED and that local HEAD matches the commit
+  # GitHub merged. Anything else (no PR, wrong state, diverged local
+  # commits, gh failure) refuses — we will not tear down without an
+  # authoritative signal. `--template` avoids a jq dependency; the
+  # space-separated shape matches `read -r` parsing.
+  command -v gh >/dev/null 2>&1 \
+    || fail "gh CLI not available; cannot verify PR merged state"
+
+  local gh_out state pr_head
+  if ! gh_out="$(gh pr view --json state,headRefOid --template '{{.state}} {{.headRefOid}}' 2>/dev/null)"; then
+    fail "gh pr view failed; verify a PR exists for $branch and gh is authenticated"
+  fi
+  read -r state pr_head <<<"$gh_out"
+  if [[ "$state" != "MERGED" ]]; then
+    fail "PR for $branch is in state '$state', not MERGED; refusing teardown"
+  fi
+  [[ -n "$pr_head" ]] \
+    || fail "gh pr view returned empty headRefOid; cannot verify local tip matches merged commit"
+
+  # HEAD must match the commit GitHub merged. Otherwise local has
+  # commits that were not part of the merged PR (e.g., committed
+  # after merge, or force-pushed out of sync), and `branch -D` would
+  # destroy them silently.
+  local local_head
+  local_head="$(git rev-parse HEAD)"
+  if [[ "$local_head" != "$pr_head" ]]; then
+    local short_local short_pr
+    short_local="$(git rev-parse --short HEAD)"
+    short_pr="$(git rev-parse --short "$pr_head" 2>/dev/null || echo "${pr_head:0:7}")"
+    fail "local HEAD ($short_local) differs from PR's merged tip ($short_pr); branch has commits not reflected in the merged PR. Push, rebase, or investigate before teardown."
+  fi
+
+  # Gates cleared. Execute teardown.
+  local this_dir common_dir
+  this_dir="$(cd "$(git rev-parse --git-dir)" && pwd)"
+  common_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+
+  if [[ "$this_dir" == "$common_dir" ]]; then
+    # Main worktree: switch to the default branch, then delete.
+    fast_forward_default_branch
+    git branch -D "$branch" \
+      || fail "git branch -D $branch failed"
+    remove_worktree_metadata "$branch"
+    ok "PR merged; branch $branch deleted"
+    return
+  fi
+
+  # Linked worktree: cd out to the main worktree before removing, so
+  # git has a valid cwd after removal. `worktree list --porcelain`
+  # lists the main worktree first; use sed so paths with spaces are
+  # preserved (awk '{print $2}' would truncate at the first space).
+  local wt_path main_wt
+  wt_path="$(git rev-parse --show-toplevel)"
+  main_wt="$(git worktree list --porcelain | sed -n 's|^worktree ||p' | head -n1)"
+  [[ -n "$main_wt" ]] \
+    || fail "could not resolve main worktree path from 'git worktree list --porcelain'"
+  # Explicit cd guard: bash's `set -e` handling inside a subshell
+  # that's part of a `( ... ) || ...` construct is inconsistent
+  # across versions, so a cd failure could otherwise cascade into
+  # 'git worktree remove' (which runs without needing cwd) and only
+  # surface as a confusing 'branch -D failed'. Fail loud at cd.
+  (
+    cd "$main_wt" \
+      || { printf 'safe-git: BLOCKED: cannot cd to main worktree %s\n' "$main_wt" >&2; exit 1; }
+    check_worktree_clean "main worktree"
+    fast_forward_default_branch
+    git worktree remove "$wt_path" \
+      || { printf 'safe-git: BLOCKED: git worktree remove %s failed\n' "$wt_path" >&2; exit 1; }
+    git branch -D "$branch" \
+      || { printf 'safe-git: BLOCKED: git branch -D %s failed\n' "$branch" >&2; exit 1; }
+    remove_worktree_metadata "$branch"
+  ) || exit 1
+  ok "PR merged; worktree $wt_path and branch $branch removed"
+}
+
+require_value() {
+  local flag="$1" value="${2:-}"
+  [[ -n "$value" ]] || fail "$flag requires a value"
+}
+
+worktree_metadata_path() {
+  local branch="$1" common_dir
+  common_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+  printf '%s/safe-git/worktrees/%s.md\n' "$common_dir" "$branch"
+}
+
+write_worktree_metadata() {
+  local wt_path="$1" branch="$2" base_ref="$3" purpose="$4" issue="$5" title="$6" activity="${7:-Created worktree from $base_ref.}"
+  local metadata_path created abs_path
+  metadata_path="$(worktree_metadata_path "$branch")"
+  created="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  abs_path="$(cd "$wt_path" && pwd)"
+  mkdir -p "$(dirname "$metadata_path")"
+  {
+    printf '# Worktree\n\n'
+    printf -- '- Branch: %s\n' "$branch"
+    printf -- '- Path: %s\n' "$abs_path"
+    printf -- '- Base: %s\n' "$base_ref"
+    printf -- '- Created: %s\n' "$created"
+    if [[ -n "$issue" ]]; then
+      printf -- '- Issue: %s\n' "$issue"
+    fi
+    if [[ -n "$title" ]]; then
+      printf -- '- Title: %s\n' "$title"
+    fi
+    printf '\n## Purpose\n\n'
+    printf '%s\n' "$purpose"
+    printf '\n## Activity Log\n\n'
+    printf -- '- %s %s\n' "$created" "$activity"
+  } >"$metadata_path"
+}
+
+remove_worktree_metadata() {
+  local branch="$1" metadata_path
+  metadata_path="$(worktree_metadata_path "$branch")"
+  rm -f "$metadata_path"
+}
+
+worktree_start() {
+  local wt_path="" branch="" base_ref="" purpose="" issue="" title="" no_fetch=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -b|--branch)
+        require_value "$1" "${2:-}"
+        branch="$2"
+        shift 2
+        ;;
+      --base)
+        require_value "$1" "${2:-}"
+        base_ref="$2"
+        shift 2
+        ;;
+      --purpose)
+        require_value "$1" "${2:-}"
+        purpose="$2"
+        shift 2
+        ;;
+      --issue)
+        require_value "$1" "${2:-}"
+        issue="$2"
+        shift 2
+        ;;
+      --title)
+        require_value "$1" "${2:-}"
+        title="$2"
+        shift 2
+        ;;
+      --no-fetch)
+        no_fetch=true
+        shift
+        ;;
+      -*)
+        fail "unknown option for worktree start: $1"
+        ;;
+      *)
+        if [[ -n "$wt_path" ]]; then
+          fail "unexpected argument for worktree start: $1"
+        fi
+        wt_path="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$wt_path" ]] || fail "worktree path is required"
+  [[ -n "$branch" ]] || fail "--branch is required"
+  [[ -n "$purpose" ]] || fail "--purpose is required"
+
+  require_repo
+  check_clean_state
+  if ! "$no_fetch"; then
+    fetch_remotes
+  fi
+  if [[ -z "$base_ref" ]]; then
+    base_ref="$(default_base_ref)"
+  fi
+  git rev-parse --verify --quiet "$base_ref" >/dev/null \
+    || fail "base ref $base_ref does not exist"
+
+  git worktree add "$wt_path" -b "$branch" "$base_ref" \
+    || fail "git worktree add $wt_path -b $branch $base_ref failed"
+  write_worktree_metadata "$wt_path" "$branch" "$base_ref" "$purpose" "$issue" "$title"
+  ok "worktree $wt_path created for $branch; description recorded at $(worktree_metadata_path "$branch")"
+}
+
+worktree_adopt() {
+  local wt_path="" purpose="" issue="" title="" base_ref="" no_fetch=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --base)
+        require_value "$1" "${2:-}"
+        base_ref="$2"
+        shift 2
+        ;;
+      --purpose)
+        require_value "$1" "${2:-}"
+        purpose="$2"
+        shift 2
+        ;;
+      --issue)
+        require_value "$1" "${2:-}"
+        issue="$2"
+        shift 2
+        ;;
+      --title)
+        require_value "$1" "${2:-}"
+        title="$2"
+        shift 2
+        ;;
+      --no-fetch)
+        no_fetch=true
+        shift
+        ;;
+      -*)
+        fail "unknown option for worktree adopt: $1"
+        ;;
+      *)
+        if [[ -n "$wt_path" ]]; then
+          fail "unexpected argument for worktree adopt: $1"
+        fi
+        wt_path="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$wt_path" ]] || fail "worktree path is required"
+  [[ -n "$purpose" ]] || fail "--purpose is required"
+
+  require_repo
+  check_clean_state
+  check_worktree_clean
+  if ! is_main_worktree; then
+    fail "current checkout is already a linked worktree; use safe-git worktree start from the main worktree for new branches"
+  fi
+
+  local branch default_branch default_ref
+  branch="$(branch_name)"
+  [[ -n "$branch" ]] || fail "detached HEAD; switch to the branch you want to adopt"
+  if is_main_branch "$branch"; then
+    fail "current branch is $branch; switch to a feature branch before adopting it into a worktree"
+  fi
+
+  if ! "$no_fetch"; then
+    fetch_remotes
+  fi
+  check_freshness
+
+  if [[ -n "$base_ref" ]]; then
+    git rev-parse --verify --quiet "$base_ref" >/dev/null \
+      || fail "base ref $base_ref does not exist"
+    default_branch="$(ref_to_local_branch "$base_ref")"
+    default_ref="$base_ref"
+  else
+    default_branch="$(default_branch_name)"
+    default_ref="origin/$default_branch"
+    git rev-parse --verify --quiet "$default_ref" >/dev/null \
+      || fail "default base $default_ref does not exist"
+  fi
+  git rev-parse --verify --quiet "$default_branch" >/dev/null \
+    || fail "local default branch $default_branch does not exist"
+
+  git checkout "$default_branch" \
+    || fail "could not switch main worktree to $default_branch; resolve manually"
+  git merge --ff-only "$default_ref" \
+    || fail "could not fast-forward $default_branch to $default_ref; resolve manually"
+  git worktree add "$wt_path" "$branch" \
+    || fail "git worktree add $wt_path $branch failed"
+  write_worktree_metadata "$wt_path" "$branch" "existing branch" "$purpose" "$issue" "$title" "Moved existing branch from main worktree."
+  ok "worktree $wt_path created for existing branch $branch; description recorded at $(worktree_metadata_path "$branch")"
+}
+
+main() {
+  case "${1:-}" in
+    check)
+      case "${2:-}" in
+        start) shift 2; check_start "$@" ;;
+        pr) shift 2; check_pr "$@" ;;
+        done) shift 2; check_done "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    worktree)
+      case "${2:-}" in
+        start) shift 2; worktree_start "$@" ;;
+        adopt) shift 2; worktree_adopt "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

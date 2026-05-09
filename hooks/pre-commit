@@ -1,6 +1,26 @@
 #!/bin/bash
 branch=$(git branch --show-current)
 if [ -z "$branch" ]; then
+  # Detached HEAD. This happens during interactive rebase, `git rebase`
+  # conflict resolution, and bisect. A commit from here is usually fine
+  # (bisect, amend during rebase on a feature branch, etc.) — but if we
+  # are mid-rebase on main/master, finishing the rebase will fast-forward
+  # main to include these commits. Detect that and block.
+  git_dir=$(git rev-parse --git-dir 2>/dev/null)
+  head_name=""
+  if [ -n "$git_dir" ]; then
+    if [ -f "$git_dir/rebase-merge/head-name" ]; then
+      head_name=$(cat "$git_dir/rebase-merge/head-name")
+    elif [ -f "$git_dir/rebase-apply/head-name" ]; then
+      head_name=$(cat "$git_dir/rebase-apply/head-name")
+    fi
+  fi
+  case "$head_name" in
+    refs/heads/main|refs/heads/master)
+      echo "ERROR: Rebase on ${head_name#refs/heads/} detected; commits here would land on that branch when the rebase completes. Abort, or rebase a feature branch instead." >&2
+      exit 1
+      ;;
+  esac
   exit 0
 fi
 if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
