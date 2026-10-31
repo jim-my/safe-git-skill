@@ -1,8 +1,96 @@
 #!/bin/bash
-while read local_ref local_sha remote_ref remote_sha; do
+# safe-git-managed-hook
+#
+# gitenv-exempt: git invokes this hook and sets GIT_DIR itself, so the ambient
+# git environment here is the authoritative context this hook must read, not a
+# leak. The receipt gate resolves the pushed branch's evidence files and SHAs
+# against the repository git is pushing from; scrubbing would repoint those reads
+# at whatever cwd resolves to, and the gate would then check the wrong repo.
+#
+# Gate 1: refuse pushes to main/master.
+# Gate 2: refuse pushing a ticket branch whose pushed SHA has no g-review
+#   receipt. The receipt is keyed by the exact pushed SHA
+#   (`skillbin g-review-receipt find-current --head-sha <sha> --for-push`), so a
+#   hand-rolled `git push` + `gh pr create` cannot bypass the review gate, and
+#   any commit after the review simply requires a re-review — there is no
+#   stale-receipt survival path. The gate is scoped to the ACTIVE ticket: among
+#   the worktree's `.plans/ticket-<id>-evidence.md` files it gates only a pushed
+#   branch with a trailing `-<id>` match (the derive-worktree convention), so a
+#   stale evidence file for an unrelated ticket never blocks the push.
+#   Override an intentional WIP push with SAFE_GIT_SKIP_RECEIPT_GATE=1.
+set -u
+
+zero="0000000000000000000000000000000000000000"
+# Parallel indexed arrays (branch + its pushed local_sha at the same index), NOT a
+# `declare -A` associative array: the hook shebang is /bin/bash and macOS ships
+# bash 3.2, where associative arrays are unsupported and would crash a normal
+# ticket push before the receipt check.
+pushed_branches=()
+pushed_shas=()
+while read -r _ local_sha remote_ref _; do
   if [ "$remote_ref" = "refs/heads/main" ] || [ "$remote_ref" = "refs/heads/master" ]; then
     echo "ERROR: Pushing to main/master is blocked. Use a feature branch and PR." >&2
     exit 1
   fi
+  # Gate on the DESTINATION branch (remote_ref), not the local ref: that is the
+  # branch that becomes the PR/ticket branch, and it is correct for every push
+  # form — `git push origin <branch>`, `git push -u origin HEAD` (local_ref=HEAD),
+  # and `git push origin HEAD:refs/heads/<dest>` (destination rename). Skip a
+  # branch deletion (local sha all-zero): no receipt is needed to delete.
+  case "$local_sha" in "$zero"|"") continue ;; esac
+  case "$remote_ref" in
+    refs/heads/*) pushed_branches+=("${remote_ref#refs/heads/}"); pushed_shas+=("$local_sha") ;;
+  esac
 done
+
+if [ "${SAFE_GIT_SKIP_RECEIPT_GATE:-}" = "1" ]; then
+  echo "safe-git: WARNING: SAFE_GIT_SKIP_RECEIPT_GATE=1 — ticket receipt gate bypassed." >&2
+  exit 0
+fi
+
+# The receipt gate engages only for the active ticket's branch. Non-ticket
+# repos and branches are untouched; a matching ticket push needs the checker.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+[ -n "$top" ] || exit 0
+[ ${#pushed_branches[@]} -gt 0 ] || exit 0
+
+shopt -s nullglob
+evidence=("$top"/.plans/ticket-*-evidence.md)
+shopt -u nullglob
+[ ${#evidence[@]} -gt 0 ] || exit 0
+
+for i in "${!pushed_branches[@]}"; do
+  branch="${pushed_branches[$i]}"
+  # A branch maps to exactly one ticket. Among evidence files whose id is a
+  # trailing `-<id>` of the branch, the active ticket is the one with the
+  # LONGEST id (most specific) — derive-worktree appends the full id as the
+  # branch suffix. Picking the longest avoids a suffix collision where a stale
+  # `ticket-bar` would also match a `...-foo-bar` branch and wrongly block it.
+  best=""; best_len=0
+  for receipt in "${evidence[@]}"; do
+    base="${receipt##*/}"; id="${base#ticket-}"; id="${id%-evidence.md}"
+    case "$branch" in *"-$id") ;; *) continue ;; esac
+    if [ "${#id}" -gt "$best_len" ]; then best="$receipt"; best_len="${#id}"; fi
+  done
+  [ -n "$best" ] || continue
+  if ! command -v skillbin >/dev/null 2>&1; then
+    echo "ERROR: ticket receipt gate — skillbin is required for a matching ticket branch push." >&2
+    echo "  Restore skillbin on PATH and retry, or explicitly override an intentional WIP push:" >&2
+    echo "      SAFE_GIT_SKIP_RECEIPT_GATE=1 git push ..." >&2
+    exit 1
+  fi
+  # Delegate both exact pushed-SHA and reviewed-base currency validation to the
+  # receipt helper; either identity moving requires a new review.
+  if ! (cd "$top" && skillbin g-review-receipt find-current \
+    --head-sha "${pushed_shas[$i]}" --for-push) >/dev/null 2>&1; then
+    echo "ERROR: ticket receipt gate — no push-eligible g-review receipt for ${pushed_shas[$i]}." >&2
+    echo "  A ticket branch push requires a g-review receipt for the exact pushed SHA," >&2
+    echo "  written on a clean tree, with verdict clean or findings fully dispositioned." >&2
+    echo "  Run g-review at this HEAD, then push. Inspect the current state with:" >&2
+    echo "      skillbin g-review-receipt find-current --head-sha ${pushed_shas[$i]} --for-push" >&2
+    echo "  Override an intentional WIP push: SAFE_GIT_SKIP_RECEIPT_GATE=1 git push ..." >&2
+    exit 1
+  fi
+done
+
 exit 0

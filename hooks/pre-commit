@@ -1,4 +1,12 @@
 #!/bin/bash
+# safe-git-managed-hook
+#
+# gitenv-exempt: git invokes this hook and sets GIT_DIR/GIT_INDEX_FILE itself, so
+# the ambient git environment here is the authoritative context this hook must
+# read, not a leak. The hook's whole job is to inspect the repository git is
+# committing to; scrubbing would repoint `git branch --show-current` and the
+# `$git_dir/rebase-merge/head-name` probe below at whatever cwd resolves to, and
+# the main/master guard would then pass on the wrong repository.
 branch=$(git branch --show-current)
 if [ -z "$branch" ]; then
   # Detached HEAD. This happens during interactive rebase, `git rebase`
