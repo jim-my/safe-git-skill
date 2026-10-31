@@ -10,7 +10,7 @@ _collect() {
   local out rc=0
   out="$(grep -HnE "$@")" || rc=$?
   [ "$rc" -le 1 ] || fail_test "grep could not scan: $*"
-  HITS+="$out"
+  [ -z "$out" ] || HITS+="${HITS:+$'\n'}$out"
 }
 
 _drop_comment_lines() {
@@ -75,6 +75,13 @@ test_detector_ignores_only_full_line_comments() {
   _find_paths_leaving_package "$PLANTED"
   assert_eq "" "$HITS" comment_line
   printf 'x="${y#p}/../../other"\n' >>"$PLANTED/bin/safe-git"
+  _assert_detector_fires _find_paths_leaving_package
+}
+
+test_comment_hit_cannot_hide_a_hit_from_the_next_scan() {
+  _planted_copy
+  printf '# see ../../elsewhere\n' >>"$PLANTED/hooks/pre-push"
+  printf 'y="$SCRIPT_DIR/../bin/x"\n' >>"$PLANTED/install.sh"
   _assert_detector_fires _find_paths_leaving_package
 }
 
