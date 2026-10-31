@@ -40,6 +40,7 @@ class SyncTest(unittest.TestCase):
         (self.target / "docs").mkdir()
         (self.target / "docs" / "owned.md").write_text("owned\n")
         (self.target / ".gitignore").write_text(".worktrees/\nworktrees/\n")
+        (self.target / "justfile").write_text("# owned\n")
         for ignored in (".worktrees", "worktrees"):
             (self.target / ignored).mkdir()
             (self.target / ignored / "kept").write_text("kept\n")
@@ -77,7 +78,7 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(os.access(self.target / "bin" / "resolve-main-worktree", os.X_OK))
         self.assertTrue((self.target / "lib" / "gitenv.sh").is_file())
         self.assertEqual((self.target / "docs" / "owned.md").read_text(), "owned\n")
-        for owned in (".gitignore", ".worktrees/kept", "worktrees/kept", f"scripts/{SCRIPT.name}"):
+        for owned in (".gitignore", "justfile", ".worktrees/kept", "worktrees/kept", f"scripts/{SCRIPT.name}"):
             self.assertTrue((self.target / owned).is_file(), owned)
         self.assertFalse((self.target / "stale.txt").exists())
 

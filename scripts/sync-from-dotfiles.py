@@ -19,7 +19,7 @@ from pathlib import Path
 TARGET = Path(__file__).resolve().parent.parent
 SKILL = "agent-skills/safe-git"
 # Paths this repo owns; the sync neither overwrites nor deletes them.
-TARGET_OWNED = [".git", ".gitignore", "docs/", "scripts/", ".worktrees/", "worktrees/"]
+TARGET_OWNED = [".git", ".gitignore", "justfile", "docs/", "scripts/", ".worktrees/", "worktrees/"]
 
 
 def fail(msg):
