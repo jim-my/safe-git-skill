@@ -39,6 +39,10 @@ class SyncTest(unittest.TestCase):
         (self.target / "scripts").mkdir(parents=True)
         (self.target / "docs").mkdir()
         (self.target / "docs" / "owned.md").write_text("owned\n")
+        (self.target / ".gitignore").write_text(".worktrees/\nworktrees/\n")
+        for ignored in (".worktrees", "worktrees"):
+            (self.target / ignored).mkdir()
+            (self.target / ignored / "kept").write_text("kept\n")
         (self.target / "stale.txt").write_text("removed by the mirror\n")
         shutil.copy2(SCRIPT, self.target / "scripts")
         git(self.target, "init", "-q")
@@ -73,6 +77,8 @@ class SyncTest(unittest.TestCase):
         self.assertTrue(os.access(self.target / "bin" / "resolve-main-worktree", os.X_OK))
         self.assertTrue((self.target / "lib" / "gitenv.sh").is_file())
         self.assertEqual((self.target / "docs" / "owned.md").read_text(), "owned\n")
+        for owned in (".gitignore", ".worktrees/kept", "worktrees/kept", f"scripts/{SCRIPT.name}"):
+            self.assertTrue((self.target / owned).is_file(), owned)
         self.assertFalse((self.target / "stale.txt").exists())
 
     def test_second_sync_changes_nothing(self):
@@ -85,7 +91,7 @@ class SyncTest(unittest.TestCase):
     def test_export_that_stops_being_self_contained_is_refused(self):
         self.commit_source("agent-skills/safe-git/bin/safe-git",
                            lambda t: t + '\n. "$SAFE_GIT_BIN_DIR/../../other-skill/lib/x.sh"\n')
-        self.assert_refused_untouched(self.sync(), "test_runtime_paths_stay_inside_package")
+        self.assert_refused_untouched(self.sync(), "test_package_passes_every_detector")
 
     def test_dirty_target_is_refused(self):
         (self.target / "docs" / "owned.md").write_text("local edit\n")
