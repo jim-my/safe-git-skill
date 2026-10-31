@@ -12,7 +12,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "smoke: FAIL: $*" >&2; exit 1; }
 expect_ok() { "$@" >"$TMP/out" 2>&1 || { cat "$TMP/out" >&2; fail "expected success: $*"; }; }
-# The message pins the refusal to safe-git, so an unrelated git error cannot pass.
+# The message pins the refusal to the guard, so an unrelated git error cannot pass.
 expect_refused() {
   local message="$1"; shift
   if "$@" >"$TMP/out" 2>&1; then fail "expected refusal: $*"; fi
@@ -58,11 +58,11 @@ BASE="$(git rev-parse origin/main)"
 
 echo change >main.txt
 git add main.txt
-expect_refused "safe-git" git commit -m "commit on main"
+expect_refused "Direct commit to main" git commit -m "commit on main"
 git reset -q
 rm main.txt
 git commit -q --allow-empty --no-verify -m "bypass to prove pre-push"
-expect_refused "safe-git" git push origin main
+expect_refused "Pushing to main" git push origin main
 [ "$(git ls-remote origin refs/heads/main | cut -f1)" = "$BASE" ] || fail "origin main moved"
 git reset -q --hard "$BASE"
 
