@@ -179,17 +179,173 @@ test_check_done_refuses_on_untracked_dirty_tree() {
   assert_fails_with "working tree is dirty"
 }
 
-test_check_done_linked_worktree_refuses_when_main_worktree_dirty() {
+# A dirty main checkout is unrelated to the feature worktree being torn
+# down: cleanup proceeds, and git's own ff-only overwrite check decides
+# whether main can move without touching the local edits.
+test_check_done_linked_worktree_cleans_up_and_fast_forwards_dirty_main() {
+  make_repo_with_remote
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  advance_remote_branch main merged-pr
+  local remote_main
+  remote_main="$(git --git-dir="$REMOTE_DIR" rev-parse main)"
+  ( cd "$REPO_DIR" && echo main-dirty >main-untracked.txt )
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_ok
+  assert_stdout_contains "worktree $WT_DIR and branch feature removed"
+  assert_file_absent "$WT_DIR"
+  capture git -C "$REPO_DIR" rev-parse --verify --quiet refs/heads/feature
+  assert_fails
+  capture git -C "$REPO_DIR" rev-parse HEAD
+  assert_eq "$remote_main" "$STDOUT" main_head_after_cleanup
+  assert_eq main-dirty "$(cat "$REPO_DIR/main-untracked.txt")" main_dirty_file
+}
+
+test_check_done_linked_worktree_cleans_up_when_dirty_main_blocks_fast_forward() {
+  make_repo_with_remote
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  advance_remote_branch main merged-pr
+  local main_before
+  main_before="$(git -C "$REPO_DIR" rev-parse HEAD)"
+  # The incoming commit adds advance.txt; an untracked copy blocks ff-only.
+  ( cd "$REPO_DIR" && echo local-edit >advance.txt )
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_ok
+  assert_stderr_contains "did not fast-forward main"
+  assert_stderr_contains "git merge --ff-only --no-autostash origin/main"
+  assert_file_absent "$WT_DIR"
+  capture git -C "$REPO_DIR" rev-parse --verify --quiet refs/heads/feature
+  assert_fails
+  capture git -C "$REPO_DIR" rev-parse HEAD
+  assert_eq "$main_before" "$STDOUT" main_head_unchanged
+  assert_eq local-edit "$(cat "$REPO_DIR/advance.txt")" main_dirty_file
+}
+
+# merge.autoStash would otherwise stash the edit, fast-forward, and
+# re-apply it with conflict markers instead of refusing.
+test_check_done_linked_worktree_dirty_main_ignores_merge_autostash() {
+  make_repo_with_remote
+  (
+    cd "$REPO_DIR"
+    echo base >advance.txt
+    git add advance.txt
+    git commit --quiet -m "track advance.txt"
+    git push --quiet origin main
+  )
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  # The incoming commit edits the tracked file the main checkout dirties.
+  advance_remote_branch main merged-pr
+  git -C "$REPO_DIR" config merge.autoStash true
+  local main_before
+  main_before="$(git -C "$REPO_DIR" rev-parse HEAD)"
+  ( cd "$REPO_DIR" && echo local-edit >advance.txt && git add advance.txt )
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_ok
+  assert_stderr_contains "did not fast-forward main"
+  assert_stderr_contains "git merge --ff-only --no-autostash origin/main"
+  assert_file_absent "$WT_DIR"
+  capture git -C "$REPO_DIR" rev-parse HEAD
+  assert_eq "$main_before" "$STDOUT" main_head_unchanged
+  assert_eq local-edit "$(cat "$REPO_DIR/advance.txt")" main_dirty_file
+  capture git -C "$REPO_DIR" stash list
+  assert_eq "" "$STDOUT" no_autostash_entry
+}
+
+# status.showUntrackedFiles=no must not make an untracked-only main
+# checkout look clean, or the clean path would switch its branch.
+test_check_done_dirty_main_detection_ignores_show_untracked_config() {
+  make_repo_with_remote
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  git -C "$REPO_DIR" config status.showUntrackedFiles no
+  (
+    cd "$REPO_DIR"
+    git checkout --quiet -b side
+    echo main-dirty >main-untracked.txt
+  )
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_ok
+  assert_stderr_contains "main worktree is dirty and on side"
+  assert_stderr_contains "git merge --ff-only --no-autostash origin/main"
+  capture git -C "$REPO_DIR" branch --show-current
+  assert_eq side "$STDOUT" main_worktree_branch
+}
+
+test_check_done_linked_worktree_cleans_up_when_dirty_main_fetch_fails() {
   make_repo_with_remote
   prep_feature_in_linked_worktree feature
   mock_gh MERGED "$FEATURE_SHA"
   ( cd "$REPO_DIR" && echo main-dirty >main-untracked.txt )
+  git -C "$REPO_DIR" remote set-url origin "$TEST_TMP/missing-remote.git"
   cd "$WT_DIR"
   capture "$SAFE_GIT" check done
-  assert_fails_with "main worktree is dirty"
-  assert_file_present "$WT_DIR"
-  capture git -C "$REPO_DIR" rev-parse --verify --quiet refs/heads/feature
   assert_ok
+  assert_stderr_contains "fetching origin/main failed"
+  assert_stderr_contains "git merge --ff-only --no-autostash origin/main"
+  assert_file_absent "$WT_DIR"
+  capture git -C "$REPO_DIR" rev-parse --verify --quiet refs/heads/feature
+  assert_fails
+}
+
+# Recovery advice printed for a dirty main on another branch must check
+# out the default branch first; a bare merge would advance that branch.
+test_check_done_dirty_main_on_side_branch_advice_targets_default_when_fetch_fails() {
+  make_repo_with_remote
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  (
+    cd "$REPO_DIR"
+    git checkout --quiet -b side
+    echo main-dirty >main-untracked.txt
+  )
+  git -C "$REPO_DIR" remote set-url origin "$TEST_TMP/missing-remote.git"
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_ok
+  assert_stderr_contains "git checkout main && git fetch origin main && git merge --ff-only --no-autostash origin/main"
+  assert_stderr_not_contains "fetching origin/main failed"
+  capture git -C "$REPO_DIR" branch --show-current
+  assert_eq side "$STDOUT" main_worktree_branch
+}
+
+test_check_done_refuses_untracked_feature_file_despite_show_untracked_config() {
+  make_repo_with_remote
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  git -C "$REPO_DIR" config status.showUntrackedFiles no
+  ( cd "$WT_DIR" && echo new >untracked.txt )
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_fails_with "working tree is dirty"
+  assert_file_present "$WT_DIR/untracked.txt"
+}
+
+test_check_done_linked_worktree_leaves_dirty_main_on_its_branch() {
+  make_repo_with_remote
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  (
+    cd "$REPO_DIR"
+    git checkout --quiet -b side
+    echo main-dirty >main-untracked.txt
+  )
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_ok
+  assert_stderr_contains "main worktree is dirty and on side"
+  assert_stderr_contains "git merge --ff-only --no-autostash origin/main"
+  assert_file_absent "$WT_DIR"
+  capture git -C "$REPO_DIR" rev-parse --verify --quiet refs/heads/feature
+  assert_fails
+  capture git -C "$REPO_DIR" branch --show-current
+  assert_eq side "$STDOUT" main_worktree_branch
+  assert_eq main-dirty "$(cat "$REPO_DIR/main-untracked.txt")" main_dirty_file
 }
 
 # --- gh-mock failure modes --------------------------------------------
@@ -326,19 +482,87 @@ test_check_done_refuses_on_unknown_flag() {
 
 # --- linked-worktree teardown failure ---------------------------------
 
-test_check_done_refuses_when_main_worktree_cd_fails() {
+test_check_done_refuses_when_main_worktree_is_invalid() {
   make_repo_with_remote
   prep_feature_in_linked_worktree feature
   mock_gh MERGED "$FEATURE_SHA"
   # Mock `git worktree list --porcelain` to claim the main worktree
-  # lives at /no/such/path; cd will fail and teardown must abort
+  # lives at /no/such/path; resolution must fail and teardown must abort
   # before calling worktree remove or branch -D.
   mock_git_worktree_list_bogus /no/such/main/worktree
   cd "$WT_DIR"
   capture "$SAFE_GIT" check done
-  assert_fails_with "cannot cd to main worktree"
+  assert_fails_with "could not resolve main worktree"
   # WT_DIR still on disk, branch still present.
   assert_file_present "$WT_DIR"
   capture git -C "$REPO_DIR" rev-parse --verify --quiet refs/heads/feature
   assert_ok
+}
+
+test_check_done_submodule_linked_uses_actual_main_checkout() {
+  make_main_worktree_layout submodule
+  trace_git_metadata_operations
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  mkdir -p "$COMMON_DIR/safe-git/worktrees"
+  echo metadata > "$COMMON_DIR/safe-git/worktrees/feature.md"
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_ok
+  assert_file_absent "$WT_DIR"
+  assert_file_absent "$TEST_TMP/metadata-operations"
+  assert_file_present "$REPO_DIR/.git"
+  assert_file_present "$COMMON_DIR/config"
+  assert_file_absent "$COMMON_DIR/safe-git/worktrees/feature.md"
+  capture git -C "$REPO_DIR" rev-parse --verify --quiet refs/heads/feature
+  assert_fails
+  assert_eq main "$(git -C "$REPO_DIR" branch --show-current)" main_branch
+}
+
+test_check_done_submodule_per_worktree_config_uses_actual_checkout() {
+  make_main_worktree_layout submodule-worktree-config
+  trace_git_metadata_operations
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_ok
+  assert_file_absent "$WT_DIR"
+  assert_file_absent "$TEST_TMP/metadata-operations"
+  assert_file_present "$COMMON_DIR/config.worktree"
+  assert_eq main "$(git -C "$REPO_DIR" branch --show-current)" main_branch
+  capture git -C "$REPO_DIR" rev-parse --verify --quiet refs/heads/feature
+  assert_fails
+}
+
+assert_no_main_teardown_preserves_state() {
+  prep_feature_in_linked_worktree feature
+  mock_gh MERGED "$FEATURE_SHA"
+  mkdir -p "$COMMON_DIR/safe-git/worktrees"
+  echo metadata > "$COMMON_DIR/safe-git/worktrees/feature.md"
+  cp "$COMMON_DIR/config" "$TEST_TMP/config-before"
+  cd "$WT_DIR"
+  capture "$SAFE_GIT" check done
+  assert_fails_with "could not resolve main worktree"
+  assert_file_present "$WT_DIR/.git"
+  assert_file_present "$COMMON_DIR/safe-git/worktrees/feature.md"
+  assert_eq "$FEATURE_SHA" "$(git rev-parse refs/heads/feature)" retained_feature
+  capture cmp "$TEST_TMP/config-before" "$COMMON_DIR/config"
+  assert_ok
+}
+
+test_check_done_bare_linked_refuses_without_main_checkout() {
+  make_main_worktree_layout bare
+  cd "$REPO_DIR"
+  capture "$SAFE_GIT" worktree start "$TEST_TMP/bare-child" -b refused --base main --purpose "bare directory" --no-fetch
+  assert_fails_with "not inside a git repository"
+  assert_file_absent "$TEST_TMP/bare-child"
+  capture git rev-parse --verify --quiet refs/heads/refused
+  assert_fails
+  assert_no_main_teardown_preserves_state
+}
+
+test_check_done_separate_linked_refuses_without_main_checkout() {
+  make_main_worktree_layout separate
+  assert_no_main_teardown_preserves_state
 }

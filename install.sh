@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 [[ -f "$SCRIPT_DIR/SKILL.md" ]] || { echo "Error: SKILL.md not found in $SCRIPT_DIR" >&2; exit 1; }
 
 AGENTS_SKILL_DIR="$HOME/.agents/skills/safe-git"

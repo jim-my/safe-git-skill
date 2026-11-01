@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# resolve-main-worktree — print the absolute path of the MAIN working tree for
+# the git repository the current directory belongs to, or fail closed.
+#
+# "Main working tree" = a durable checkout that outlives a task's linked worktree
+# (which `safe-git check done` removes). The `snapshot` / `resume-from-snapshot`
+# skills write and read `.agents/snapshot/` under it, so a wrong answer silently
+# loses handoff state. `git rev-parse --show-toplevel` is NOT it — from a linked
+# worktree that is the linked worktree.
+#
+# Resolution, by git layout (each exercised by a real fixture in
+# resolve_main_worktree_test.sh):
+#   1. Ordinary repo (from the main checkout or any linked worktree): the first
+#      `git worktree list --porcelain -z` record is the registered main working
+#      tree — but git 2.43 reports it as a git dir for a submodule, bare, or
+#      --separate-git-dir layout, so accept it only when it is inside a work tree.
+#      This runs first so a repo that merely points `core.worktree` at one of its
+#      linked worktrees still resolves to the registered main tree.
+#   2. `core.worktree` recovery (only when branch 1's first record was a git dir):
+#      a submodule, or a linked worktree of one, has no other path back to its
+#      durable checkout. `core.worktree` lives in the shared git dir's `config`,
+#      or the main worktree's `config.worktree` when the submodule sets
+#      `extensions.worktreeConfig`. Read NUL-terminated (`git config -z`) so a
+#      newline in the value survives to the guard; resolved through `resolve_dir`
+#      (absolute or `.git`-relative, per git-config) and accepted only when it is
+#      THIS git dir's own main working tree (`is_main_worktree`) — so a value
+#      pointed at a linked worktree, or a checkout replaced by an unrelated repo,
+#      fails closed.
+#   3. --separate-git-dir MAIN checkout: no `worktree` record points at the
+#      checkout, but git-dir == git-common-dir means we ARE the main checkout, so
+#      the work-tree root (reached via `--show-cdup` + `resolve_dir`) is it —
+#      accepted only when it is inside a work tree AND is this git dir's main
+#      working tree (an unrelated repo at the newline-stripped path would
+#      otherwise pass the work-tree check alone).
+#   4. Anything else — a linked worktree of a --separate-git-dir or bare repo
+#      (no `core.worktree`, git-dir != git-common-dir), a bare repo dir, or not a
+#      repo at all — fails closed.
+#
+# Output: the absolute path on stdout + exit 0, or nothing on stdout + a typed
+#   `resolve-main-worktree: <reason>` line on stderr + a typed exit code:
+#     exit 3  not-a-git-repo              — `git rev-parse` found no repository
+#     exit 4  no-resolvable-main-worktree — a repo, but no durable main checkout is
+#             reachable, OR the resolved path contains a newline
+#
+# A resolved path containing a newline (embedded OR trailing) is refused: the
+# callers capture it with `$(...)` (which strips a trailing newline), and
+# `resume-from-snapshot` then feeds it through `find | sort | tail` and a
+# newline-delimited 3-token block, none of which can represent it unambiguously.
+# A git checkout path with a literal newline does not occur in practice, so
+# refusing it (rather than carrying it through a NUL-safe protocol into both
+# consumer skills) is the deliberate trade. The refusal only holds if every
+# candidate keeps its newline until `emit` checks it: `$(cmd)` strips a trailing
+# one, so each branch resolves its candidate through `resolve_dir`, which carries
+# the path via `$PWD` + a NUL-terminated read instead.
+set -euo pipefail
+
+# Strip ambient git env vars (GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR / …) so a
+# leaked value from a hook or a caller cannot redirect this resolver at a
+# different repository (#1687). This helper's entire job is git discovery, so the
+# scrub is load-bearing, not boilerplate.
+# shellcheck source=../lib/gitenv.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/gitenv.sh"
+scrub_git_env
+
+nl="$(printf '\nx')"; nl="${nl%x}"   # a bare newline (command sub strips a trailing one)
+
+# Typed exit codes so a caller can tell the two failures apart without parsing
+# stderr: 3 = not a git repo, 4 = a repo but no durable main checkout is reachable.
+fail() {
+	printf 'resolve-main-worktree: %s\n' "$1" >&2
+	exit "$2"
+}
+
+# Emit a resolved path, or fail closed if it contains a newline (see the header):
+# neither the callers' `$(...)` capture nor the resume snapshot-selection /
+# 3-token output can carry such a path intact.
+emit() {
+	case "$1" in
+	*"$nl"*) fail no-resolvable-main-worktree 4 ;;
+	esac
+	printf '%s\n' "$1"
+	exit 0
+}
+
+# resolve_dir <base> <target> <out-var>: cd into <base> then <target> and set
+# <out-var> to the resulting logical path, with any embedded OR trailing newline
+# in the real name intact, or return non-zero if that directory is not reachable.
+# The two-step `cd` means an absolute <target> is honoured verbatim and a relative
+# one resolves against <base> — matching how git treats `core.worktree` (absolute,
+# or relative to the `.git` dir). `$(cd … && pwd)` cannot be used: command
+# substitution strips a trailing newline, so a directory literally named
+# "<path>\n" would reach `emit` as "<path>" and slip past its guard. `$PWD`
+# (bash-maintained) plus a NUL-terminated read preserves it.
+resolve_dir() {
+	local __base=$1 __target=$2 __out=$3 __p
+	IFS= read -r -d '' __p \
+		< <(cd "$__base" 2>/dev/null && cd "$__target" 2>/dev/null && printf '%s\0' "$PWD") || return 1
+	[ -n "$__p" ] || return 1
+	printf -v "$__out" '%s' "$__p"
+}
+
+# read_config_z <file> <key> <out-var>: set <out-var> to the NUL-terminated value
+# of <key> in <file> (a newline in the value survives, unlike `$(git config …)`),
+# empty if unset.
+read_config_z() {
+	local __v=''
+	IFS= read -r -d '' __v < <(git config -z -f "$1" "$2" 2>/dev/null) || true
+	printf -v "$3" '%s' "$__v"
+}
+
+git_common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || true
+[ -n "$git_common" ] || fail not-a-git-repo 3
+
+# A candidate is THE main working tree of this git dir only when its own
+# `--git-dir` equals `$git_common`. That is false for a linked worktree
+# (`$git_common/worktrees/<id>`) and for an unrelated repo (`<its>/.git`), so it
+# rejects both a `core.worktree` pointed at a linked worktree and a submodule
+# checkout that was replaced by something else.
+is_main_worktree() {
+	[ "$(git -C "$1" rev-parse --path-format=absolute --git-dir 2>/dev/null)" = "$git_common" ]
+}
+
+# 1. Registered main working tree. `git worktree list --porcelain -z`'s first
+# record is it for an ordinary repo (from the main checkout or any linked
+# worktree) — but git 2.43 reports that first record as the git dir for a
+# submodule, bare, or --separate-git-dir layout, so accept it only when the path
+# is a real work tree (`<path>/.git` exists) that this git dir serves. A `.git`
+# check rather than `git -C <path> rev-parse --is-inside-work-tree`, because a
+# `core.worktree` pointed elsewhere makes that lie about the real checkout. This
+# runs before `core.worktree` so such a repo still resolves to its registered
+# main tree.
+cand=""
+while IFS= read -r -d '' record; do
+	case "$record" in
+	"worktree "*)
+		cand="${record#worktree }"
+		break
+		;;
+	esac
+done < <(git worktree list --porcelain -z 2>/dev/null)
+
+if [ -n "$cand" ] && [ -e "$cand/.git" ] && is_main_worktree "$cand"; then
+	emit "$cand"
+fi
+
+# 2. `core.worktree` recovery — only reached when branch 1's first record was a
+# git dir (submodule, bare, or --separate-git-dir). For a submodule that is the
+# ONLY path back to the durable checkout. It lives in the shared git dir's
+# `config`, or the main worktree's `config.worktree` when `extensions.worktreeConfig`
+# is set. `git config -z` keeps a newline in the stored value so `emit`'s guard
+# can see it; accept the resolved candidate only when it is THIS git dir's main
+# working tree (`is_main_worktree`), so a value pointed at a linked worktree or an
+# unrelated repo fails closed.
+read_config_z "$git_common/config" core.worktree core_wt
+if [ "$(git config --type=bool -f "$git_common/config" extensions.worktreeConfig 2>/dev/null || true)" = true ]; then
+	read_config_z "$git_common/config.worktree" core.worktree wt_core_wt
+	[ -z "$wt_core_wt" ] || core_wt="$wt_core_wt"
+fi
+if [ -n "$core_wt" ]; then
+	case "$core_wt" in
+	*"$nl"*) fail no-resolvable-main-worktree 4 ;;
+	esac
+	resolved=''
+	if resolve_dir "$git_common" "$core_wt" resolved && is_main_worktree "$resolved"; then
+		emit "$resolved"
+	fi
+	fail no-resolvable-main-worktree 4
+fi
+
+# 3. --separate-git-dir MAIN checkout: git-dir == git-common-dir means we ARE the
+# main checkout, so its work-tree root is the answer. Reach it via `--show-cdup`
+# (only `../` segments — no newline risk) + `resolve_dir` so a work-tree path that
+# ends in a newline keeps it. Accept only when it is inside a work tree AND is
+# this git dir's main working tree — the work-tree check alone would pass for an
+# unrelated repo sitting at the newline-stripped path.
+git_dir="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)" || true
+if [ -n "$git_dir" ] && [ "$git_dir" = "$git_common" ]; then
+	cdup="$(git rev-parse --show-cdup 2>/dev/null)" || cdup=''
+	top=''
+	if resolve_dir . "${cdup:-.}" top \
+		&& [ "$(git -C "$top" rev-parse --is-inside-work-tree 2>/dev/null)" = true ] \
+		&& is_main_worktree "$top"; then
+		emit "$top"
+	fi
+fi
+
+# 4. No durable main checkout is reachable.
+fail no-resolvable-main-worktree 4

@@ -4,7 +4,7 @@ Plain-bash tests for `safe-git check {start,pr,done}` and the
 `pre-commit` / `pre-push` hooks.
 
 ```sh
-claude/skills/safe-git/test/run.sh
+test/run.sh
 ```
 
 Each `*_test.sh` file defines `test_*` functions. `run.sh` discovers
