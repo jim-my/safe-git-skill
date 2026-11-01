@@ -57,7 +57,10 @@ def main():
 
         head = run("git", "-C", str(source), "rev-parse", "HEAD").strip()
         (build / "SYNCED_FROM").write_text(f"{head}\n")
-        excludes = [f"--exclude=/{owned}" for owned in TARGET_OWNED]
+        # --delete would otherwise remove ignored files, which the dirty check cannot see.
+        ignored = run("git", "-C", str(TARGET), "ls-files", "-z", "--others", "--ignored",
+                      "--exclude-standard", "--directory").split("\0")
+        excludes = [f"--exclude=/{path}" for path in TARGET_OWNED + list(filter(None, ignored))]
         run("rsync", "-a", "--delete", *excludes, f"{build}/", f"{TARGET}/")
     print(f"sync-from-dotfiles: synced {SKILL} at {head[:12]}")
 

@@ -20,7 +20,8 @@ expect_refused() {
 }
 
 for var in $(compgen -e | grep '^GIT_' || true); do unset "$var"; done
-unset CODEX_HOME
+unset CODEX_HOME XDG_CONFIG_HOME
+export GIT_CONFIG_NOSYSTEM=1
 
 CLEAN_PATH=""
 IFS=: read -ra PATH_DIRS <<<"$PATH"

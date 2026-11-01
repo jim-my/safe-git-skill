@@ -21,6 +21,7 @@ def git(cwd, *args):
                           cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
+@unittest.skipUnless((DOTFILES / ".git").exists(), f"needs a dotfiles checkout at {DOTFILES}; set DOTFILES_DIR")
 class SyncTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -81,6 +82,18 @@ class SyncTest(unittest.TestCase):
         for owned in (".gitignore", "justfile", ".worktrees/kept", "worktrees/kept", f"scripts/{SCRIPT.name}"):
             self.assertTrue((self.target / owned).is_file(), owned)
         self.assertFalse((self.target / "stale.txt").exists())
+
+    def test_ignored_files_survive(self):
+        with open(self.target / ".gitignore", "a") as ignore:
+            ignore.write("local.env\ncache/\n")
+        git(self.target, "commit", "-qam", "ignore more")
+        (self.target / "local.env").write_text("keep\n")
+        (self.target / "cache").mkdir()
+        (self.target / "cache" / "entry").write_text("keep\n")
+        result = self.sync("--no-tests")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.target / "local.env").read_text(), "keep\n")
+        self.assertEqual((self.target / "cache" / "entry").read_text(), "keep\n")
 
     def test_second_sync_changes_nothing(self):
         self.assertEqual(self.sync("--no-tests").returncode, 0)
