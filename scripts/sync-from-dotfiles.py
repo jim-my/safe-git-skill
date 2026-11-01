@@ -3,8 +3,9 @@
 
 That directory runs on its own, and its test suite fails if it stops being so.
 This script exports it from the source's committed HEAD, runs the suite on the
-export, and only then mirrors it here, so a failed sync changes nothing. It
-refuses to run over uncommitted changes.
+export, and only then mirrors it here, so a failed export or test run changes
+nothing. It refuses to run over uncommitted changes, so if the mirror step itself
+fails, `git checkout -- .` restores this repo.
 
 Usage: scripts/sync-from-dotfiles.py [--source DOTFILES_DIR] [--no-tests]
 """
