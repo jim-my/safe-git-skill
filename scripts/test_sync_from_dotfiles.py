@@ -85,15 +85,28 @@ class SyncTest(unittest.TestCase):
 
     def test_ignored_files_survive(self):
         with open(self.target / ".gitignore", "a") as ignore:
-            ignore.write("local.env\ncache/\n")
+            ignore.write("local.env\ncache/\n*.keep\n")
         git(self.target, "commit", "-qam", "ignore more")
         (self.target / "local.env").write_text("keep\n")
+        (self.target / "a[1]*.keep").write_text("keep\n")
         (self.target / "cache").mkdir()
         (self.target / "cache" / "entry").write_text("keep\n")
         result = self.sync("--no-tests")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.target / "local.env").read_text(), "keep\n")
+        self.assertEqual((self.target / "a[1]*.keep").read_text(), "keep\n")
         self.assertEqual((self.target / "cache" / "entry").read_text(), "keep\n")
+
+    def test_tracked_file_replaced_by_directory_in_export(self):
+        (self.target / "lib").write_text("was a file\n")
+        (self.target / "gone" / "deep").mkdir(parents=True)
+        (self.target / "gone" / "deep" / "stale").write_text("stale\n")
+        git(self.target, "add", "-A")
+        git(self.target, "commit", "-qm", "stale shapes")
+        result = self.sync("--no-tests")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.target / "lib" / "gitenv.sh").is_file())
+        self.assertFalse((self.target / "gone").exists())
 
     def test_second_sync_changes_nothing(self):
         self.assertEqual(self.sync("--no-tests").returncode, 0)
