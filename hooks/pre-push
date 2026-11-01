@@ -28,7 +28,8 @@ zero="0000000000000000000000000000000000000000"
 # ticket push before the receipt check.
 pushed_branches=()
 pushed_shas=()
-while read -r _ local_sha remote_ref _; do
+pushed_sources=()
+while read -r local_ref local_sha remote_ref _; do
   if [ "$remote_ref" = "refs/heads/main" ] || [ "$remote_ref" = "refs/heads/master" ]; then
     echo "ERROR: Pushing to main/master is blocked. Use a feature branch and PR." >&2
     exit 1
@@ -40,7 +41,11 @@ while read -r _ local_sha remote_ref _; do
   # branch deletion (local sha all-zero): no receipt is needed to delete.
   case "$local_sha" in "$zero"|"") continue ;; esac
   case "$remote_ref" in
-    refs/heads/*) pushed_branches+=("${remote_ref#refs/heads/}"); pushed_shas+=("$local_sha") ;;
+    refs/heads/*)
+      pushed_branches+=("${remote_ref#refs/heads/}")
+      pushed_shas+=("$local_sha")
+      pushed_sources+=("${local_ref#refs/heads/}")
+      ;;
   esac
 done
 
@@ -56,21 +61,28 @@ fi
 # Evidence lives in the ticket's worktree, which need not be the checkout running
 # the push: `git push origin <branch>` works from any of them, and from inside the
 # git dir, where there is no work tree. The pushing checkout always counts. Another
-# worktree counts when it has the pushed branch checked out or a detached HEAD, so a
-# shared `-<id>` suffix on an unrelated branch does not engage the gate. An empty
-# branch below means "counts for every push".
+# worktree counts when it has the pushed source or destination branch checked out, a
+# detached HEAD, or the pushed commit as its HEAD, so a shared `-<id>` suffix on an
+# unrelated branch does not engage the gate. An empty branch below means "counts for
+# every push".
 worktree_roots=()
 worktree_branches=()
+worktree_heads=()
 top=$(git rev-parse --show-toplevel 2>/dev/null) || top=""
 if [ -n "$top" ]; then
   worktree_roots+=("$top")
   worktree_branches+=("")
+  worktree_heads+=("")
 fi
 while IFS= read -r line; do
   case "$line" in
     "worktree "*)
       worktree_roots+=("${line#worktree }")
       worktree_branches+=("")
+      worktree_heads+=("")
+      ;;
+    "HEAD "*)
+      worktree_heads[${#worktree_heads[@]}-1]="${line#HEAD }"
       ;;
     "branch refs/heads/"*)
       worktree_branches[${#worktree_branches[@]}-1]="${line#branch refs/heads/}"
@@ -85,8 +97,10 @@ for i in "${!pushed_branches[@]}"; do
   shopt -s nullglob
   for j in "${!worktree_roots[@]}"; do
     case "${worktree_branches[$j]}" in
-      ""|"$branch") evidence+=("${worktree_roots[$j]}"/.plans/ticket-*-evidence.md) ;;
+      ""|"$branch"|"${pushed_sources[$i]}") ;;
+      *) [ "${worktree_heads[$j]}" = "${pushed_shas[$i]}" ] || continue ;;
     esac
+    evidence+=("${worktree_roots[$j]}"/.plans/ticket-*-evidence.md)
   done
   shopt -u nullglob
   [ ${#evidence[@]} -gt 0 ] || continue

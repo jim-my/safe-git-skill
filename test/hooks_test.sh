@@ -197,6 +197,39 @@ test_pre_push_ignores_same_suffix_evidence_on_another_worktrees_branch() {
   assert_ok
 }
 
+# Renaming the destination must not hide the evidence on the source branch's worktree.
+test_pre_push_blocks_destination_rename_from_another_checkout() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  mock_skillbin_receipt_check 1
+  capture run_pre_push "$REPO_DIR" "refs/heads/feature/foo-7 aaaaaaa refs/heads/feature/renamed-7 bbbbbbb"
+  assert_fails_with "ticket receipt gate"
+}
+
+# A sha or tag refspec names no source branch, so the commit identifies the worktree.
+test_pre_push_blocks_rename_by_sha_of_the_evidence_worktrees_head() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  mock_skillbin_receipt_check 1
+  git -C "$WT_DIR" commit --quiet --allow-empty -m ticket-work
+  local sha
+  sha="$(git -C "$WT_DIR" rev-parse HEAD)"
+  capture run_pre_push "$REPO_DIR" "$sha $sha refs/heads/feature/renamed-7 bbbbbbb"
+  assert_fails_with "ticket receipt gate"
+}
+
+# The source only selects the worktree: the ticket still matches on the destination.
+test_pre_push_allows_rename_to_a_destination_outside_the_ticket() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  mock_skillbin_receipt_check 1
+  capture run_pre_push "$REPO_DIR" "refs/heads/feature/foo-7 aaaaaaa refs/heads/scratch bbbbbbb"
+  assert_ok
+}
+
 test_pre_push_ignores_other_ticket_evidence_in_a_linked_worktree() {
   make_repo_with_remote
   make_linked_worktree feature/foo-7
