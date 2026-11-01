@@ -115,6 +115,97 @@ test_pre_push_blocks_ticket_branch_without_receipt() {
   assert_fails_with "ticket receipt gate"
 }
 
+# `git push origin <branch>` from the main checkout must see evidence that lives
+# only in that branch's linked worktree, the same as a push from the worktree.
+test_pre_push_blocks_when_evidence_is_only_in_a_linked_worktree() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  mock_skillbin_receipt_check 1
+  capture run_pre_push "$REPO_DIR" "$TICKET_PUSH"
+  assert_fails_with "ticket receipt gate"
+}
+
+test_pre_push_blocks_when_skillbin_missing_and_evidence_is_in_a_linked_worktree() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  capture run_pre_push "$REPO_DIR" "$TICKET_PUSH"
+  assert_fails_with "skillbin is required"
+}
+
+# The receipt lookup must run from the checkout that holds the evidence, because
+# the helper judges that checkout's state.
+test_pre_push_checks_receipt_from_the_worktree_holding_the_evidence() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  local expected
+  expected="$(cd "$WT_DIR" && pwd -P)"
+  cat >"$MOCK_BIN/skillbin" <<EOF
+#!/usr/bin/env bash
+[ "\$(pwd -P)" = "$expected" ]
+EOF
+  chmod +x "$MOCK_BIN/skillbin"
+  capture run_pre_push "$REPO_DIR" "$TICKET_PUSH"
+  assert_ok
+}
+
+# Git can export GIT_DIR to hooks, and it would repoint the lookup at the pushing
+# checkout despite the cd.
+test_pre_push_receipt_lookup_does_not_inherit_git_dir() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  cat >"$MOCK_BIN/skillbin" <<EOF
+#!/usr/bin/env bash
+[ -z "\${GIT_DIR:-}" ] && [ -z "\${GIT_WORK_TREE:-}" ]
+EOF
+  chmod +x "$MOCK_BIN/skillbin"
+  capture bash -c 'cd "$1" && printf "%s\n" "$2" | GIT_DIR="$1/.git" GIT_WORK_TREE="$1" bash "$3" origin file:///dev/null' _ \
+    "$REPO_DIR" "$TICKET_PUSH" "$HOOKS_DIR/pre-push"
+  assert_ok
+}
+
+test_pre_push_blocks_when_pushed_from_inside_the_git_dir() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  mock_skillbin_receipt_check 1
+  capture run_pre_push "$REPO_DIR/.git" "$TICKET_PUSH"
+  assert_fails_with "ticket receipt gate"
+}
+
+test_pre_push_blocks_when_evidence_is_in_a_detached_worktree() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  git -C "$WT_DIR" checkout --quiet --detach
+  mock_skillbin_receipt_check 1
+  capture run_pre_push "$REPO_DIR" "$TICKET_PUSH"
+  assert_fails_with "ticket receipt gate"
+}
+
+# A shared `-7` suffix is not enough: another worktree's evidence belongs to the
+# branch that worktree has checked out.
+test_pre_push_ignores_same_suffix_evidence_on_another_worktrees_branch() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  mock_skillbin_receipt_check 1
+  capture run_pre_push "$REPO_DIR" "refs/heads/feature/bar-7 aaaaaaa refs/heads/feature/bar-7 bbbbbbb"
+  assert_ok
+}
+
+test_pre_push_ignores_other_ticket_evidence_in_a_linked_worktree() {
+  make_repo_with_remote
+  make_linked_worktree feature/foo-7
+  seed_ticket_evidence "$WT_DIR" 7
+  mock_skillbin_receipt_check 1
+  capture run_pre_push "$REPO_DIR" "refs/heads/feature/bar-8 aaaaaaa refs/heads/feature/bar-8 bbbbbbb"
+  assert_ok
+}
+
 test_pre_push_allows_ticket_branch_with_push_eligible_receipt() {
   make_repo_with_remote
   seed_ticket_evidence "$REPO_DIR" 7

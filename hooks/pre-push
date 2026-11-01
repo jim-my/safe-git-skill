@@ -3,7 +3,8 @@
 #
 # gitenv-exempt: git invokes this hook and sets GIT_DIR itself, so the ambient
 # git environment here is the authoritative context this hook must read, not a
-# leak. The receipt gate resolves the pushed branch's evidence files and SHAs
+# leak, except for the receipt lookup, which runs in the worktree holding the
+# evidence. The receipt gate resolves the pushed branch's evidence files and SHAs
 # against the repository git is pushing from; scrubbing would repoint those reads
 # at whatever cwd resolves to, and the gate would then check the wrong repo.
 #
@@ -14,7 +15,7 @@
 #   hand-rolled `git push` + `gh pr create` cannot bypass the review gate, and
 #   any commit after the review simply requires a re-review — there is no
 #   stale-receipt survival path. The gate is scoped to the ACTIVE ticket: among
-#   the worktree's `.plans/ticket-<id>-evidence.md` files it gates only a pushed
+#   the relevant worktrees' `.plans/ticket-<id>-evidence.md` files it gates only a pushed
 #   branch with a trailing `-<id>` match (the derive-worktree convention), so a
 #   stale evidence file for an unrelated ticket never blocks the push.
 #   Override an intentional WIP push with SAFE_GIT_SKIP_RECEIPT_GATE=1.
@@ -50,17 +51,45 @@ fi
 
 # The receipt gate engages only for the active ticket's branch. Non-ticket
 # repos and branches are untouched; a matching ticket push needs the checker.
-top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
-[ -n "$top" ] || exit 0
 [ ${#pushed_branches[@]} -gt 0 ] || exit 0
 
-shopt -s nullglob
-evidence=("$top"/.plans/ticket-*-evidence.md)
-shopt -u nullglob
-[ ${#evidence[@]} -gt 0 ] || exit 0
+# Evidence lives in the ticket's worktree, which need not be the checkout running
+# the push: `git push origin <branch>` works from any of them, and from inside the
+# git dir, where there is no work tree. The pushing checkout always counts. Another
+# worktree counts when it has the pushed branch checked out or a detached HEAD, so a
+# shared `-<id>` suffix on an unrelated branch does not engage the gate. An empty
+# branch below means "counts for every push".
+worktree_roots=()
+worktree_branches=()
+top=$(git rev-parse --show-toplevel 2>/dev/null) || top=""
+if [ -n "$top" ]; then
+  worktree_roots+=("$top")
+  worktree_branches+=("")
+fi
+while IFS= read -r line; do
+  case "$line" in
+    "worktree "*)
+      worktree_roots+=("${line#worktree }")
+      worktree_branches+=("")
+      ;;
+    "branch refs/heads/"*)
+      worktree_branches[${#worktree_branches[@]}-1]="${line#branch refs/heads/}"
+      ;;
+  esac
+done < <(git worktree list --porcelain 2>/dev/null)
+[ ${#worktree_roots[@]} -gt 0 ] || exit 0
 
 for i in "${!pushed_branches[@]}"; do
   branch="${pushed_branches[$i]}"
+  evidence=()
+  shopt -s nullglob
+  for j in "${!worktree_roots[@]}"; do
+    case "${worktree_branches[$j]}" in
+      ""|"$branch") evidence+=("${worktree_roots[$j]}"/.plans/ticket-*-evidence.md) ;;
+    esac
+  done
+  shopt -u nullglob
+  [ ${#evidence[@]} -gt 0 ] || continue
   # A branch maps to exactly one ticket. Among evidence files whose id is a
   # trailing `-<id>` of the branch, the active ticket is the one with the
   # LONGEST id (most specific) — derive-worktree appends the full id as the
@@ -81,7 +110,9 @@ for i in "${!pushed_branches[@]}"; do
   fi
   # Delegate both exact pushed-SHA and reviewed-base currency validation to the
   # receipt helper; either identity moving requires a new review.
-  if ! (cd "$top" && skillbin g-review-receipt find-current \
+  # The evidence may be in another worktree, so the lookup must not inherit the
+  # pushing checkout's git environment.
+  if ! (unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; cd "${best%/.plans/*}" && skillbin g-review-receipt find-current \
     --head-sha "${pushed_shas[$i]}" --for-push) >/dev/null 2>&1; then
     echo "ERROR: ticket receipt gate — no push-eligible g-review receipt for ${pushed_shas[$i]}." >&2
     echo "  A ticket branch push requires a g-review receipt for the exact pushed SHA," >&2
