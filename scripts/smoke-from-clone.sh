@@ -42,6 +42,9 @@ git clone -q "$ROOT" "$TMP/skill"
 expect_ok "$TMP/skill/install.sh"
 SAFE_GIT="$HOME/.local/bin/safe-git"
 [ -x "$SAFE_GIT" ] || fail "install.sh did not link $SAFE_GIT"
+for skill_dir in "$HOME/.claude/skills/safe-git" "$HOME/.codex/skills/safe-git"; do
+  [ -s "$skill_dir/SKILL.md" ] || fail "install.sh did not link a skill at $skill_dir"
+done
 export PATH="$HOME/.local/bin:$PATH"
 
 git init -q --bare "$TMP/origin.git"

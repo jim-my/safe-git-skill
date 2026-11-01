@@ -108,6 +108,51 @@ class SyncTest(unittest.TestCase):
         self.assertTrue((self.target / "lib" / "gitenv.sh").is_file())
         self.assertFalse((self.target / "gone").exists())
 
+    def test_export_path_matching_an_ignore_rule_is_refused(self):
+        with open(self.target / ".gitignore", "a") as ignore:
+            ignore.write("local.env\n")
+        git(self.target, "commit", "-qam", "ignore more")
+        (self.target / "local.env").write_text("SECRET\n")
+        self.start_state = self.snapshot()
+        (self.source / "agent-skills/safe-git/local.env").write_text("shipped\n")
+        git(self.source, "add", "-A")
+        git(self.source, "commit", "-qm", "ship a path the target ignores")
+        self.assert_refused_untouched(self.sync("--no-tests"), "local.env")
+
+    def test_exported_owned_paths_do_not_overwrite(self):
+        (self.source / "agent-skills/safe-git/justfile").write_text("from export\n")
+        (self.source / "agent-skills/safe-git/docs").mkdir()
+        (self.source / "agent-skills/safe-git/docs/owned.md").write_text("from export\n")
+        git(self.source, "add", "-A")
+        git(self.source, "commit", "-qm", "ship owned paths")
+        self.assertEqual(self.sync("--no-tests").returncode, 0)
+        self.assertEqual((self.target / "justfile").read_text(), "# owned\n")
+        self.assertEqual((self.target / "docs" / "owned.md").read_text(), "owned\n")
+
+    def test_synced_from_names_the_exported_commit_when_source_moves(self):
+        run_sh = f'''git -C "{self.source}" -c user.email=t@e -c user.name=t commit -q --allow-empty -m moved
+'''
+        self.commit_source("agent-skills/safe-git/test/run.sh", lambda _: run_sh)
+        exported = git(self.source, "rev-parse", "HEAD").strip()
+        result = self.sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(git(self.source, "rev-parse", "HEAD").strip(), exported)
+        self.assertEqual((self.target / "SYNCED_FROM").read_text().strip(), exported)
+
+    def test_files_the_suite_writes_do_not_ship(self):
+        self.commit_source("agent-skills/safe-git/test/run.sh",
+                           lambda _: "echo junk > leftover.log\necho changed >> SKILL.md\n")
+        expected = (self.source / "agent-skills/safe-git/SKILL.md").read_text()
+        self.assertEqual(self.sync().returncode, 0)
+        self.assertFalse((self.target / "leftover.log").exists())
+        self.assertEqual((self.target / "SKILL.md").read_text(), expected)
+
+    def test_dirty_check_ignores_a_config_that_hides_untracked_files(self):
+        git(self.target, "config", "status.showUntrackedFiles", "no")
+        (self.target / "SKILL.md").write_text("untracked local work\n")
+        self.start_state = self.snapshot()
+        self.assert_refused_untouched(self.sync("--no-tests"), "uncommitted changes")
+
     def test_second_sync_changes_nothing(self):
         self.assertEqual(self.sync("--no-tests").returncode, 0)
         git(self.target, "add", "-A")
